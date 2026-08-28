@@ -19,6 +19,11 @@ set "MSI_FILE=%TEMP%\GLPI-Agent-1.17-x64.msi"
 set "MSI_LOG=C:\Windows\Temp\GLPI-Agent-1.17-install.log"
 set "UNINSTALL_LOG=C:\Windows\Temp\GLPI-Agent-uninstall.log"
 set "CFG_BACKUP=C:\Windows\Temp\GLPI-Agent-agent.cfg.bak"
+set "TASK_FIX_DIR=C:\ProgramData\GLPI"
+set "TASK_FIX_PS1=%TASK_FIX_DIR%\Correctif_GLPI_Taches_PT4M_Auto.ps1"
+set "TASK_FIX_B64=%TEMP%\Correctif_GLPI_Taches_PT4M_Auto.b64"
+set "REG_VERSION_FILE=%TEMP%\GLPI-Agent-installed-version.txt"
+set "FORCE_REPAIR=0"
 
 REM ==========================================================
 REM DROITS ADMINISTRATEUR
@@ -56,24 +61,33 @@ if exist "%AGENT_CFG%" (
 echo.
 
 REM ==========================================================
-REM VERSION ACTUELLE
+REM VERSION ACTUELLE - LECTURE REGISTRE SANS LANCER L'AGENT
 REM ==========================================================
 
-if exist "%AGENT_BAT%" (
-    echo Version actuelle :
-    call "%AGENT_BAT%" --version
-    echo.
+if exist "%REG_VERSION_FILE%" del /q "%REG_VERSION_FILE%" >nul 2>&1
 
-    "%AGENT_BAT%" --version 2>nul | findstr /C:"(%TARGET_VERSION%)" >nul
-    if "!ERRORLEVEL!"=="0" (
-        echo GLPI Agent %TARGET_VERSION% est deja installe.
-        goto CONFIGURE_AND_INVENTORY
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$roots=@('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall');" ^
+  "$version='';" ^
+  "foreach($root in $roots){if(Test-Path $root){foreach($k in Get-ChildItem $root -ErrorAction SilentlyContinue){$p=Get-ItemProperty -LiteralPath $k.PSPath -ErrorAction SilentlyContinue;if($p.DisplayName -like 'GLPI Agent*' -and $p.DisplayVersion){$version=[string]$p.DisplayVersion;break}}};if($version){break}};" ^
+  "if($version){Set-Content -LiteralPath '%REG_VERSION_FILE%' -Value $version -Encoding ASCII}"
+
+set "INSTALLED_VERSION="
+if exist "%REG_VERSION_FILE%" set /p "INSTALLED_VERSION="<"%REG_VERSION_FILE%"
+
+if defined INSTALLED_VERSION (
+    echo Version enregistree : !INSTALLED_VERSION!
+    if /I "!INSTALLED_VERSION!"=="%TARGET_VERSION%" (
+        echo GLPI Agent %TARGET_VERSION% est deja enregistre.
+        echo Reparation complete forcee pour remplacer toute DLL incompatible.
+        set "FORCE_REPAIR=1"
+    ) else (
+        echo Mise a jour de !INSTALLED_VERSION! vers %TARGET_VERSION%...
     )
-
-    echo Une autre version est installee.
-    echo Tentative de mise a jour vers %TARGET_VERSION%...
+) else if exist "%AGENT_DIR%" (
+    echo Installation GLPI Agent presente mais version registre introuvable.
+    echo Reinstallation propre vers %TARGET_VERSION%...
 ) else (
-    echo GLPI Agent absent ou incomplet.
     echo Installation propre de la version %TARGET_VERSION%...
 )
 
@@ -114,8 +128,66 @@ REM ==========================================================
 echo [3/8] Installation / mise a jour en cours...
 
 net stop glpi-agent >nul 2>&1
+taskkill.exe /IM glpi-agent.exe /T /F >nul 2>&1
+timeout /t 2 /nobreak >nul
 
-msiexec.exe /i "%MSI_FILE%" /qn /norestart SERVER="%GLPI_URL%" ADDLOCAL=feat_DEPLOY TASKS=Inventory,Deploy ADD_FIREWALL_EXCEPTION=1 /L*v "%MSI_LOG%"
+if "!FORCE_REPAIR!"=="1" (
+    echo Arret et suppression temporaire des anciennes taches GLPI...
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$names=@('GLPI Deploy Check','GLPI Deploy Every 5 Minutes','GLPI Deploy At Startup','GLPI Inventory At Startup','GLPI Inventory Every 24 Hours');" ^
+      "foreach($name in $names){Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue}"
+
+    net stop glpi-agent >nul 2>&1
+    sc.exe config glpi-agent start= disabled >nul 2>&1
+    taskkill.exe /IM glpi-agent.exe /T /F >nul 2>&1
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$prefix='%AGENT_DIR%\';" ^
+      "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {[string]$_.ExecutablePath -like ($prefix+'*')} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
+
+    timeout /t 3 /nobreak >nul
+
+    echo Desinstallation silencieuse de la copie 1.17 endommagee...
+    if exist "%UNINSTALL_LOG%" del /q "%UNINSTALL_LOG%" >nul 2>&1
+    msiexec.exe /x "%MSI_FILE%" /qn /norestart /L*v "%UNINSTALL_LOG%"
+    set "REPAIR_UNINSTALL_RESULT=!ERRORLEVEL!"
+    if "!REPAIR_UNINSTALL_RESULT!"=="3010" set "REPAIR_UNINSTALL_RESULT=0"
+    if "!REPAIR_UNINSTALL_RESULT!"=="1605" set "REPAIR_UNINSTALL_RESULT=0"
+
+    net stop glpi-agent >nul 2>&1
+    taskkill.exe /IM glpi-agent.exe /T /F >nul 2>&1
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+      "$prefix='%AGENT_DIR%\';" ^
+      "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {[string]$_.ExecutablePath -like ($prefix+'*')} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
+    sc.exe delete glpi-agent >nul 2>&1
+    timeout /t 3 /nobreak >nul
+
+    echo Mise a l'ecart du dossier contenant les DLL incompatibles...
+    set "BROKEN_DIR=C:\Program Files\GLPI-Agent.broken"
+    if exist "!BROKEN_DIR!" set "BROKEN_DIR=C:\Program Files\GLPI-Agent.broken-%RANDOM%"
+
+    if exist "%AGENT_DIR%" (
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
+          "$src='%AGENT_DIR%';$dst=[IO.Path]::GetFileName('!BROKEN_DIR!');" ^
+          "for($i=1;$i -le 5;$i++){try{if(Test-Path -LiteralPath $src){Rename-Item -LiteralPath $src -NewName $dst -Force -ErrorAction Stop};exit 0}catch{Start-Sleep -Seconds 2}};exit 13"
+    )
+
+    if exist "%AGENT_DIR%" (
+        echo ERREUR : impossible de liberer l'ancien dossier GLPI-Agent.
+        goto ERROR_END
+    )
+
+    echo Reinstallation propre GLPI Agent %TARGET_VERSION%...
+    if "!REPAIR_UNINSTALL_RESULT!"=="0" (
+        msiexec.exe /i "%MSI_FILE%" /qn /norestart SERVER="%GLPI_URL%" ADDLOCAL=feat_DEPLOY TASKS=Inventory,Deploy ADD_FIREWALL_EXCEPTION=1 /L*v "%MSI_LOG%"
+    ) else (
+        echo Desinstallation retournee avec le code !REPAIR_UNINSTALL_RESULT!.
+        echo Tentative de reparation MSI forcee apres liberation du dossier...
+        msiexec.exe /i "%MSI_FILE%" /qn /norestart REINSTALL=ALL REINSTALLMODE=amus SERVER="%GLPI_URL%" ADDLOCAL=feat_DEPLOY TASKS=Inventory,Deploy ADD_FIREWALL_EXCEPTION=1 /L*v "%MSI_LOG%"
+    )
+) else (
+    msiexec.exe /i "%MSI_FILE%" /qn /norestart SERVER="%GLPI_URL%" ADDLOCAL=feat_DEPLOY TASKS=Inventory,Deploy ADD_FIREWALL_EXCEPTION=1 /L*v "%MSI_LOG%"
+)
 set "INSTALL_RESULT=!ERRORLEVEL!"
 
 if "!INSTALL_RESULT!"=="0" goto INSTALL_OK
@@ -378,46 +450,58 @@ if not "!INV_RESULT!"=="0" (
 )
 
 REM ==========================================================
-REM TACHE PLANIFIEE DEPLOY FORCE TOUTES LES 5 MINUTES
+REM TACHES PLANIFIEES + GARDE ANTI-BLOCAGE PT4M
 REM ==========================================================
 
 echo.
-echo Creation / mise a jour de la tache planifiee GLPI Deploy Check...
-echo Compte : SYSTEM
-echo Frequence : toutes les 5 minutes
-echo Commande : glpi-agent.bat --tasks deploy --force
+echo Creation / correction des taches planifiees GLPI...
+echo Deploy : demarrage + toutes les 5 minutes
+echo Inventory : demarrage + toutes les 24 heures
+echo Limite tache Deploy : PT4M
+echo Kill de l'arbre Deploy par le garde apres 3 minutes
 echo.
+
+if not exist "%TASK_FIX_DIR%" (
+    mkdir "%TASK_FIX_DIR%" >nul 2>&1
+)
+
+REM BEGIN EMBEDDED TASK FIX BASE64
+> "%TASK_FIX_B64%" (
+    echo 77u/JEVycm9yQWN0aW9uUHJlZmVyZW5jZSA9ICJTdG9wIgoKJEJhc2VEaXIgPSAiQzpcUHJvZ3JhbURhdGFcR0xQSSIKJExvZ0RpciAgPSAiQzpcV2luZG93c1xUZW1wIgokQWdlbnRCYXQgPSAiQzpcUHJvZ3JhbSBGaWxlc1xHTFBJLUFnZW50XGdscGktYWdlbnQuYmF0IgoKTmV3LUl0ZW0gLUl0ZW1UeXBlIERpcmVjdG9yeSAtRm9yY2UgLVBhdGggJEJhc2VEaXIgfCBPdXQtTnVsbAoKZnVuY3Rpb24gV3JpdGUtR3VhcmRTY3JpcHQgewogICAgcGFyYW0oCiAgICAgICAgW3N0cmluZ10kUGF0aCwKICAgICAgICBbVmFsaWRhdGVTZXQoIkRlcGxveSIsIkludmVudG9yeSIpXQogICAgICAgIFtzdHJpbmddJFRhc2ssCiAgICAgICAgW2ludF0kVGltZW91dFNlY29uZHMsCiAgICAgICAgW3N0cmluZ10kTG9nRmlsZQogICAgKQoKICAgICRjb250ZW50ID0gQCIKYCRFcnJvckFjdGlvblByZWZlcmVuY2UgPSAiU3RvcCIKYCRBZ2VudEJhdCA9ICIkQWdlbnRCYXQiCmAkTG9nRmlsZSA9ICIkTG9nRmlsZSIKYCRUaW1lb3V0U2Vjb25kcyA9ICRUaW1lb3V0U2Vjb25kcwpgJFRhc2sgPSAiJFRhc2siCgpmdW5jdGlvbiBMb2coW3N0cmluZ11gJE1lc3NhZ2UpIHsKICAgIEFkZC1Db250ZW50IC1QYXRoIGAkTG9nRmlsZSAtVmFsdWUgKCJbezB9XSB7MX0iIC1mIChHZXQtRGF0ZSAtRm9ybWF0ICJ5eXl5LU1NLWRkIEhIOm1tOnNzIiksIGAkTWVzc2FnZSkgLUVuY29kaW5nIFVURjgKfQoKdHJ5IHsKICAgIGlmICgtbm90IChUZXN0LVBhdGggYCRBZ2VudEJhdCkpIHsKICAgICAgICBMb2cgIkVSUkVVUiA6IEdMUEkgQWdlbnQgaW50cm91dmFibGUgOiBgJEFnZW50QmF0IgogICAgICAgIGV4aXQgMTAKICAgIH0KCiAgICBMb2cgIkRlYnV0IGAkVGFzayIKCiAgICAjIGNtZC5leGUgZXN0IGxhbmPDqSBjb21tZSBwcm9jZXNzdXMgcGFyZW50IGFmaW4gcXVlIHRhc2traWxsIC9UIHB1aXNzZQogICAgIyB0ZXJtaW5lciBhdXNzaSBsZXMgw6l2ZW50dWVscyBwcm9jZXNzdXMgZW5mYW50cyBkdSBHTFBJIEFnZW50LgogICAgYCRhcmdzID0gIi9jIGAiYCJgJEFnZW50QmF0YCIgLS10YXNrcyBgJFRhc2sgLS1mb3JjZWAiIgogICAgYCRwID0gU3RhcnQtUHJvY2VzcyAtRmlsZVBhdGggImNtZC5leGUiIC1Bcmd1bWVudExpc3QgYCRhcmdzIC1QYXNzVGhydSAtV2luZG93U3R5bGUgSGlkZGVuCgogICAgaWYgKC1ub3QgYCRwLldhaXRGb3JFeGl0KGAkVGltZW91dFNlY29uZHMgKiAxMDAwKSkgewogICAgICAgIExvZyAiVElNRU9VVCA6IGAkVGFzayBkZXBhc3NlIGAkVGltZW91dFNlY29uZHMgc2Vjb25kZXMuIEFycmV0IGRlIGwnYXJicmUgZGUgcHJvY2Vzc3VzIFBJRCBgJChgJHAuSWQpLiIKICAgICAgICAmIHRhc2traWxsLmV4ZSAvUElEIGAkcC5JZCAvVCAvRiB8IE91dC1OdWxsCiAgICAgICAgU3RhcnQtU2xlZXAgLVNlY29uZHMgMgogICAgICAgIGV4aXQgMTI0CiAgICB9CgogICAgYCRjb2RlID0gYCRwLkV4aXRDb2RlCiAgICBMb2cgIkZpbiBgJFRhc2sgLSBjb2RlIGAkY29kZSIKICAgIGV4aXQgYCRjb2RlCn0KY2F0Y2ggewogICAgTG9nICJFUlJFVVIgYCRUYXNrIDogYCQoYCRfLkV4Y2VwdGlvbi5NZXNzYWdlKSIKICAgIGV4aXQgOTkKfQoiQAogICAgU2V0LUNvbnRlbnQgLVBhdGggJFBhdGggLVZhbHVlICRjb250ZW50IC1FbmNvZGluZyBVVEY4Cn0KCiREZXBsb3lHdWFyZCA9IEpvaW4tUGF0aCAkQmFzZURpciAiR0xQSS1EZXBsb3ktR3VhcmQucHMxIgokSW52ZW50b3J5R3VhcmQgPSBKb2luLVBhdGggJEJhc2VEaXIgIkdMUEktSW52ZW50b3J5LUd1YXJkLnBzMSIKCiMgRGVwbG95IDogb24gbmUgbGFpc3NlIGphbWFpcyB1bmUgZXjDqWN1dGlvbiBibG9xdcOpZSBwbHVzIGRlIDMgbWludXRlcy4KV3JpdGUtR3VhcmRTY3JpcHQgYAogICAgLVBhdGggJERlcGxveUd1YXJkIGAKICAgIC1UYXNrICJEZXBsb3kiIGAKICAgIC1UaW1lb3V0U2Vjb25kcyAxODAgYAogICAgLUxvZ0ZpbGUgKEpvaW4tUGF0aCAkTG9nRGlyICJHTFBJLURlcGxveS1HdWFyZC5sb2ciKQoKIyBJbnZlbnRvcnkgOiBkw6lsYWkgcGx1cyBsYXJnZSBjYXIgdW4gaW52ZW50YWlyZSBwZXV0IMOqdHJlIHBsdXMgbG9uZy4KV3JpdGUtR3VhcmRTY3JpcHQgYAogICAgLVBhdGggJEludmVudG9yeUd1YXJkIGAKICAgIC1UYXNrICJJbnZlbnRvcnkiIGAKICAgIC1UaW1lb3V0U2Vjb25kcyA5MDAgYAogICAgLUxvZ0ZpbGUgKEpvaW4tUGF0aCAkTG9nRGlyICJHTFBJLUludmVudG9yeS1HdWFyZC5sb2ciKQoKJERlcGxveUFjdGlvbiA9IE5ldy1TY2hlZHVsZWRUYXNrQWN0aW9uIGAKICAgIC1FeGVjdXRlICJwb3dlcnNoZWxsLmV4ZSIgYAogICAgLUFyZ3VtZW50ICItTm9Qcm9maWxlIC1FeGVjdXRpb25Qb2xpY3kgQnlwYXNzIC1GaWxlIGAiJERlcGxveUd1YXJkYCIiCgokSW52ZW50b3J5QWN0aW9uID0gTmV3LVNjaGVkdWxlZFRhc2tBY3Rpb24gYAogICAgLUV4ZWN1dGUgInBvd2Vyc2hlbGwuZXhlIiBgCiAgICAtQXJndW1lbnQgIi1Ob1Byb2ZpbGUgLUV4ZWN1dGlvblBvbGljeSBCeXBhc3MgLUZpbGUgYCIkSW52ZW50b3J5R3VhcmRgIiIKCiREZXBsb3lTZXR0aW5ncyA9IE5ldy1TY2hlZHVsZWRUYXNrU2V0dGluZ3NTZXQgYAogICAgLVN0YXJ0V2hlbkF2YWlsYWJsZSBg
+    echo CiAgICAtRXhlY3V0aW9uVGltZUxpbWl0IChOZXctVGltZVNwYW4gLU1pbnV0ZXMgNCkgYAogICAgLU11bHRpcGxlSW5zdGFuY2VzIElnbm9yZU5ldwoKJEludmVudG9yeVNldHRpbmdzID0gTmV3LVNjaGVkdWxlZFRhc2tTZXR0aW5nc1NldCBgCiAgICAtU3RhcnRXaGVuQXZhaWxhYmxlIGAKICAgIC1FeGVjdXRpb25UaW1lTGltaXQgKE5ldy1UaW1lU3BhbiAtTWludXRlcyAxNikgYAogICAgLU11bHRpcGxlSW5zdGFuY2VzIElnbm9yZU5ldwoKIyBOZXR0b3lhZ2UgZGVzIGFuY2llbnMgbm9tcyB2dXMgc3VyIGxlIHBhcmMuCiMgTmV0dG95YWdlIHVuaXF1ZW1lbnQgZGVzIGFuY2llbnMgbm9tcyBhbHRlcm5hdGlmcy4KIyBJTVBPUlRBTlQgOiBvbiBuZSBzdXBwcmltZSBwbHVzICJHTFBJIERlcGxveSBDaGVjayIuCiMgQydlc3QgcHLDqWNpc8OpbWVudCBjZXR0ZSB0w6JjaGUgaGlzdG9yaXF1ZSBxdWUgbCdvbiBjb3JyaWdlIGVuIHBsYWNlLgokT2xkVGFza05hbWVzID0gQCgKICAgICJHTFBJIERlcGxveSBFdmVyeSA1IE1pbnV0ZXMiLAogICAgIkdMUEkgRGVwbG95IEF0IFN0YXJ0dXAiLAogICAgIkdMUEkgSW52ZW50b3J5IEF0IFN0YXJ0dXAiLAogICAgIkdMUEkgSW52ZW50b3J5IEV2ZXJ5IDI0IEhvdXJzIgopCgpmb3JlYWNoICgkbmFtZSBpbiAkT2xkVGFza05hbWVzKSB7CiAgICB0cnkgeyBTdG9wLVNjaGVkdWxlZFRhc2sgLVRhc2tOYW1lICRuYW1lIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlIH0gY2F0Y2gge30KICAgIHRyeSB7IFVucmVnaXN0ZXItU2NoZWR1bGVkVGFzayAtVGFza05hbWUgJG5hbWUgLUNvbmZpcm06JGZhbHNlIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlIH0gY2F0Y2gge30KfQoKIyBERVBMT1kgQVUgREVNQVJSQUdFCiREZXBsb3lTdGFydHVwVHJpZ2dlciA9IE5ldy1TY2hlZHVsZWRUYXNrVHJpZ2dlciAtQXRTdGFydHVwClJlZ2lzdGVyLVNjaGVkdWxlZFRhc2sgYAogICAgLVRhc2tOYW1lICJHTFBJIERlcGxveSBBdCBTdGFydHVwIiBgCiAgICAtQWN0aW9uICREZXBsb3lBY3Rpb24gYAogICAgLVRyaWdnZXIgJERlcGxveVN0YXJ0dXBUcmlnZ2VyIGAKICAgIC1TZXR0aW5ncyAkRGVwbG95U2V0dGluZ3MgYAogICAgLVVzZXIgIlNZU1RFTSIgYAogICAgLVJ1bkxldmVsIEhpZ2hlc3QgYAogICAgLUZvcmNlIHwgT3V0LU51bGwKCiMgREVQTE9ZIFRPVVRFUyBMRVMgNSBNSU5VVEVTCiMgT24gcsOpdXRpbGlzZSBsZSBub20gaGlzdG9yaXF1ZSBkdSBwYXJjIDogIkdMUEkgRGVwbG95IENoZWNrIi4KJERlcGxveTVNaW5UcmlnZ2VyID0gTmV3LVNjaGVkdWxlZFRhc2tUcmlnZ2VyIGAKICAgIC1PbmNlIGAKICAgIC1BdCAoR2V0LURhdGUpLkFkZE1pbnV0ZXMoMSkgYAogICAgLVJlcGV0aXRpb25JbnRlcnZhbCAoTmV3LVRpbWVTcGFuIC1NaW51dGVzIDUpCgpSZWdpc3Rlci1TY2hlZHVsZWRUYXNrIGAKICAgIC1UYXNrTmFtZSAiR0xQSSBEZXBsb3kgQ2hlY2siIGAKICAgIC1BY3Rpb24gJERlcGxveUFjdGlvbiBgCiAgICAtVHJpZ2dlciAkRGVwbG95NU1pblRyaWdnZXIgYAogICAgLVNldHRpbmdzICREZXBsb3lTZXR0aW5ncyBgCiAgICAtVXNlciAiU1lTVEVNIiBgCiAgICAtUnVuTGV2ZWwgSGlnaGVzdCBgCiAgICAtRm9yY2UgfCBPdXQtTnVsbAoKIyBDT1JSRUNUSU9OIEVYUExJQ0lURSBEVSBQQVJBTcOIVFJFIFFVSSBSRVNUQUlUIMOAIFBUNzJIIFNVUiBDRVJUQUlOUyBQT1NURVMuCiMgQ2V0dGUgY29tbWFuZGUgZm9yY2UgcsOpZWxsZW1lbnQgRXhlY3V0aW9uVGltZUxpbWl0IMOgIDQgbWludXRlcyAoPSBQVDRNKS4KJFRhc2sgPSBHZXQtU2NoZWR1bGVkVGFzayAtVGFza05hbWUgIkdMUEkgRGVwbG95IENoZWNrIgokRXhhY3REZXBsb3lTZXR0aW5ncyA9IE5ldy1TY2hlZHVsZWRUYXNrU2V0dGluZ3NTZXQgYAogICAgLUV4ZWN1dGlvblRpbWVMaW1pdCAoTmV3LVRpbWVTcGFuIC1NaW51dGVzIDQpIGAKICAgIC1NdWx0aXBsZUluc3RhbmNlcyBJZ25vcmVOZXcgYAogICAgLVN0YXJ0V2hlbkF2YWlsYWJsZQoKU2V0LVNjaGVkdWxlZFRhc2sgYAogICAgLVRhc2tOYW1lICJHTFBJIERlcGxveSBDaGVjayIgYAogICAgLVNldHRpbmdzICRFeGFjdERlcGxveVNldHRpbmdzIHwgT3V0LU51bGwKCiMgSU5WRU5UQUlSRSBBVSBERU1BUlJBR0UKJEludmVudG9yeVN0YXJ0dXBUcmlnZ2VyID0gTmV3LVNjaGVkdWxlZFRhc2tUcmlnZ2VyIC1BdFN0YXJ0dXAKUmVnaXN0ZXItU2NoZWR1bGVkVGFzayBgCiAgICAtVGFza05hbWUgIkdMUEkgSW52ZW50b3J5IEF0IFN0YXJ0dXAiIGAKICAgIC1BY3Rpb24gJEludmVudG9yeUFjdGlvbiBgCiAgICAtVHJpZ2dlciAkSW52ZW50b3J5U3RhcnR1cFRyaWdnZXIgYAogICAgLVNldHRpbmdzICRJbnZlbnRvcnlTZXR0aW5ncyBgCiAgICAtVXNlciAiU1lTVEVNIiBgCiAgICAtUnVuTGV2ZWwgSGlnaGVzdCBgCiAgICAtRm9yY2UgfCBPdXQtTnVsbAoKIyBJTlZFTlRBSVJFIFRPVVRFUyBMRVMgMjQgSEVVUkVTCiMgRMOpcGFydCAyIG1pbnV0ZXMgYXByw6hzIGwnaW5zdGFsbGF0aW9uIGR1IGNvcnJlY3RpZiwgcHVpcyBjaGFxdWUgam91ciDDoCBjZXR0ZSBoZXVyZS4KJEludmVudG9yeURhaWx5VHJpZ2dlciA9IE5ldy1TY2hlZHVsZWRUYXNrVHJp
+    echo Z2dlciBgCiAgICAtRGFpbHkgYAogICAgLUF0IChHZXQtRGF0ZSkuQWRkTWludXRlcygyKQoKUmVnaXN0ZXItU2NoZWR1bGVkVGFzayBgCiAgICAtVGFza05hbWUgIkdMUEkgSW52ZW50b3J5IEV2ZXJ5IDI0IEhvdXJzIiBgCiAgICAtQWN0aW9uICRJbnZlbnRvcnlBY3Rpb24gYAogICAgLVRyaWdnZXIgJEludmVudG9yeURhaWx5VHJpZ2dlciBgCiAgICAtU2V0dGluZ3MgJEludmVudG9yeVNldHRpbmdzIGAKICAgIC1Vc2VyICJTWVNURU0iIGAKICAgIC1SdW5MZXZlbCBIaWdoZXN0IGAKICAgIC1Gb3JjZSB8IE91dC1OdWxsCgojIFRlc3QgaW1tw6lkaWF0IGR1IERlcGxveSBzYW5zIGF0dGVuZHJlIGxlIHByb2NoYWluIHBhc3NhZ2UuClN0YXJ0LVNjaGVkdWxlZFRhc2sgLVRhc2tOYW1lICJHTFBJIERlcGxveSBDaGVjayIKCldyaXRlLUhvc3QgIiIKV3JpdGUtSG9zdCAiPT09IFRBQ0hFUyBHTFBJIENPUlJJR0VFUyA9PT0iCkdldC1TY2hlZHVsZWRUYXNrIHwKICAgIFdoZXJlLU9iamVjdCB7ICRfLlRhc2tOYW1lIC1pbiBAKAogICAgICAgICJHTFBJIERlcGxveSBDaGVjayIsCiAgICAgICAgIkdMUEkgRGVwbG95IEF0IFN0YXJ0dXAiLAogICAgICAgICJHTFBJIEludmVudG9yeSBBdCBTdGFydHVwIiwKICAgICAgICAiR0xQSSBJbnZlbnRvcnkgRXZlcnkgMjQgSG91cnMiCiAgICApIH0gfAogICAgU2VsZWN0LU9iamVjdCBUYXNrTmFtZSxTdGF0ZSwKICAgICAgICBAe049IkV4ZWN1dGlvblRpbWVMaW1pdCI7RT17JF8uU2V0dGluZ3MuRXhlY3V0aW9uVGltZUxpbWl0fX0sCiAgICAgICAgQHtOPSJNdWx0aXBsZUluc3RhbmNlcyI7RT17JF8uU2V0dGluZ3MuTXVsdGlwbGVJbnN0YW5jZXN9fQoKV3JpdGUtSG9zdCAiIgpXcml0ZS1Ib3N0ICJWZXJpZmljYXRpb24gR0xQSSBEZXBsb3kgQ2hlY2sgOiIKJENoZWNrID0gR2V0LVNjaGVkdWxlZFRhc2sgLVRhc2tOYW1lICJHTFBJIERlcGxveSBDaGVjayIKV3JpdGUtSG9zdCAoIkV4ZWN1dGlvblRpbWVMaW1pdCA9ICIgKyAkQ2hlY2suU2V0dGluZ3MuRXhlY3V0aW9uVGltZUxpbWl0KQppZiAoJENoZWNrLlNldHRpbmdzLkV4ZWN1dGlvblRpbWVMaW1pdCAtbmUgIlBUNE0iKSB7CiAgICBXcml0ZS1Ib3N0ICJFUlJFVVIgOiBsYSBsaW1pdGUgbidlc3QgcGFzIFBUNE0iIC1Gb3JlZ3JvdW5kQ29sb3IgUmVkCiAgICBleGl0IDIwCn0KV3JpdGUtSG9zdCAiT0sgOiBsaW1pdGUgRGVwbG95ID0gUFQ0TSAoNCBtaW51dGVzKSIgLUZvcmVncm91bmRDb2xvciBHcmVlbgoKZXhpdCAwCg==
+)
+REM END EMBEDDED TASK FIX BASE64
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
   "$ErrorActionPreference='Stop';" ^
-  "$taskName='GLPI Deploy Check';" ^
-  "Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue;" ^
-  "$action=New-ScheduledTaskAction -Execute 'C:\Program Files\GLPI-Agent\glpi-agent.bat' -Argument '--tasks deploy --force';" ^
-  "$trigger=New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5);" ^
-  "$principal=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest;" ^
-  "$settings=New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries;" ^
-  "Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null;" ^
-  "$t=Get-ScheduledTask -TaskName $taskName;" ^
-  "if(-not $t){exit 10};" ^
-  "Start-ScheduledTask -TaskName $taskName;" ^
-  "Start-Sleep -Seconds 3;" ^
-  "$i=Get-ScheduledTaskInfo -TaskName $taskName;" ^
-  "Write-Host ('Tache creee : '+$taskName);" ^
-  "Write-Host ('Derniere execution : '+$i.LastRunTime);" ^
-  "Write-Host ('Prochaine execution : '+$i.NextRunTime);" ^
-  "Write-Host ('Dernier resultat : '+$i.LastTaskResult);" ^
-  "exit 0"
+  "$b64=(Get-Content -LiteralPath '%TASK_FIX_B64%' -Raw) -replace '\s','';" ^
+  "[IO.File]::WriteAllBytes('%TASK_FIX_PS1%',[Convert]::FromBase64String($b64))"
+
+set "TASK_BUILD_RESULT=!ERRORLEVEL!"
+del /q "%TASK_FIX_B64%" >nul 2>&1
+
+if not "!TASK_BUILD_RESULT!"=="0" (
+    echo ATTENTION : impossible de reconstruire le correctif PowerShell integre.
+    set "TASK_RESULT=!TASK_BUILD_RESULT!"
+    goto TASK_FIX_RESULT
+)
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%TASK_FIX_PS1%"
 
 set "TASK_RESULT=!ERRORLEVEL!"
 
+:TASK_FIX_RESULT
+
 if not "!TASK_RESULT!"=="0" (
     echo.
-    echo ATTENTION : impossible de creer ou tester la tache GLPI Deploy Check.
+    echo ATTENTION : impossible de creer ou verifier les taches GLPI protegees.
     echo Code : !TASK_RESULT!
 ) else (
     echo.
-    echo Tache GLPI Deploy Check creee sous SYSTEM.
-    echo Elle forcera Deploy toutes les 5 minutes.
+    echo Taches GLPI creees / corrigees sous SYSTEM.
+    echo GLPI Deploy Check force Deploy toutes les 5 minutes.
+    echo La limite PT4M et le kill anti-blocage sont actifs.
 )
 
 echo ==========================================================
